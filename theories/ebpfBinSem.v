@@ -966,28 +966,37 @@ Definition exec_instr_event (i: instruction) : etrace :=
   | _                     => eE0
   end.
 
+(** The code body the current instruction is fetched from: the main body, or
+    the tail-call target named by [code_id]. *)
+Definition find_code (code_id:option nat) (bpf_prog: ebpf_prog): option code :=
+  match code_id with
+  | None => Some (main_code bpf_prog)
+  | Some idx => (jump_table bpf_prog) idx
+  end.
+
 Inductive step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_step_internal:
-      forall c idx b ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
+      forall c b ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
       rs PC = Vptr b ofs ->
-      (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      find_code code_id p = Some c ->
       find_instr (Ptrofs.unsigned ofs) c = Some i ->
       exec_instr p i rs stk code_id tail_call_cnt m addr_map = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_instr_event i = et ->
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m')
   | exec_step_external:
-      forall c idx b ofs cty i res rs stk code_id tail_call_cnt m rs' code_id' tail_call_cnt' m',
+      forall c b ofs cty i res rs stk code_id tail_call_cnt m rs' m',
       rs PC = Vptr b ofs ->
-      (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      find_code code_id p = Some c ->
       find_instr (Ptrofs.unsigned ofs) c = Some (Pcall cty i) ->
       cty = CallByBTF \/ cty = CallByStaticID ->
       ebpf_call_function i rs#R1 rs#R2 rs#R3 rs#R4 rs#R5 (Next rs stk code_id tail_call_cnt m) = Some (res, m') -> (**r an ebpf call may invoke another ebpf program that modifies the global memory *)
-      rs' = nextinstr (undef_caller_save_regs rs)
+      (** A call occupies one slot: [PC] is advanced once, as in the kernel
+          interpreter ([JMP_CALL] ends in [CONT]).  A helper call is not a
+          tail call: the code body and the tail-call counter are unchanged. *)
+      rs' = (undef_caller_save_regs rs)
                 #R0 <- res
                 #PC <- (Val.offset_ptr (rs#PC) Ptrofs.one) ->
-      step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id' tail_call_cnt' m')
+      step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id tail_call_cnt m')
       .
 
 Inductive initial_lst_state (ctx blk stk: block): tls_state -> Prop :=
@@ -1039,12 +1048,6 @@ Definition is_final_state (stk_blk: block) (rs: regset) (m: mem) (stk : cstk): b
     end
   (** we don't check the memory here *)
 .
-
-Definition find_code (code_id:option nat) (bpf_prog: ebpf_prog): option code :=
-  match code_id with
-  | None => Some (main_code bpf_prog)
-  | Some idx => (jump_table bpf_prog) idx
-  end.
 
 Fixpoint bpf_interpreter_old (fuel: nat) (bpf_prog: ebpf_prog) (st: outcome) (addr_map: list addr_region) (stk_blk: block): option val :=
   match fuel with
@@ -1103,13 +1106,27 @@ Definition update_core (tp: ThreadPool) (t: tid) (r: regset): ThreadPool :=
 |}.
 
 
-Definition atomic_fun (w: width) (aty: atomic_type) :=
+(** The width is the instruction's own: [BPF_DW] or [BPF_W]. *)
+Definition atomic_width (aty: atomic_type) : width :=
   match aty with
-  | AtomicADD w => if w then Val.addl else Val.add
-  | AtomicOR  w => if w then Val.orl else Val.or
-  | AtomicXOR w => if w then Val.xorl else Val.xorl
-  | AtomicAND w => if w then Val.andl else Val.andl
-  | _ => Val.andl (** TODO *)
+  | AtomicADD db _ | AtomicOR db _ | AtomicAND db _ | AtomicXOR db _
+  | AtomicXCHG db | AtomicCMPXCHG db => if db then W64 else W32
+  | LOAD_ACQUIRE _ | STORE_RELEASE _ => W64
+  end.
+
+Definition atomic_fun (aty: atomic_type) : option (val -> val -> val) :=
+  match aty with
+  | AtomicADD db _ => Some (if db then Val.addl else Val.add)
+  | AtomicOR  db _ => Some (if db then Val.orl else Val.or)
+  | AtomicAND db _ => Some (if db then Val.andl else Val.and)
+  | AtomicXOR db _ => Some (if db then Val.xorl else Val.xor)
+  | _ => None
+  end.
+
+Definition atomic_fetch (aty: atomic_type) : bool :=
+  match aty with
+  | AtomicADD _ f | AtomicOR _ f | AtomicAND _ f | AtomicXOR _ f => f
+  | _ => false
   end.
 
 Definition chunk_of_width (w: width) :=
@@ -1118,36 +1135,71 @@ Definition chunk_of_width (w: width) :=
   | W64 => Mint64
   end.
 
-Definition exec_atomic_store (w: width) (aty: atomic_type) (dst src: ireg) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+(** The old value as written back to a register: a 32-bit value is
+    zero-extended. *)
+Definition fetch_value (w: width) (v: val) : val :=
+  match w with
+  | W32 => Val.longofintu v
+  | W64 => v
+  end.
+
+Definition exec_atomic_store (aty: atomic_type) (dst src: ireg) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+  let w := atomic_width aty in
+  let chunk := chunk_of_width w in
   let addr := Val.offset_ptr (rs dst) o in
   let sv := match w with W32 => Val.loword (rs src) | W64 => rs src end in
-    match Mem.loadv (chunk_of_width w) m addr with
+    match Mem.loadv chunk m addr with
     | None => Stuck
     | Some v =>
-      let res := (atomic_fun w aty v sv) in
-        match Mem.storev (chunk_of_width w) m addr res with
+      match aty with
+      | AtomicXCHG _ =>
+        match Mem.storev chunk m addr sv with
         | None => Stuck
-        | Some m' => Next (nextinstr rs) stk code_id tail_call_cnt m'
+        | Some m' => Next (nextinstr (rs#src <- (fetch_value w v))) stk code_id tail_call_cnt m'
         end
+      | AtomicCMPXCHG _ =>
+        let r0 := match w with W32 => Val.loword (rs R0) | W64 => rs R0 end in
+        let rs' := nextinstr (rs#R0 <- (fetch_value w v)) in
+        let eq := match w with W32 => Val.cmp_bool Ceq v r0 | W64 => Val.cmpl_bool Ceq v r0 end in
+        match eq with
+        | None => Stuck
+        | Some true =>
+          match Mem.storev chunk m addr sv with
+          | None => Stuck
+          | Some m' => Next rs' stk code_id tail_call_cnt m'
+          end
+        | Some false => Next rs' stk code_id tail_call_cnt m
+        end
+      | _ =>
+        match atomic_fun aty with
+        | None => Stuck
+        | Some f =>
+          match Mem.storev chunk m addr (f v sv) with
+          | None => Stuck
+          | Some m' =>
+            let rs' := if atomic_fetch aty then rs#src <- (fetch_value w v) else rs in
+              Next (nextinstr rs') stk code_id tail_call_cnt m'
+          end
+        end
+      end
     end.
 
-Definition exec_atomic (w: width) (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+Definition exec_atomic (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
   match src with
-  | inl r => exec_atomic_store w aty dst r o rs stk code_id tail_call_cnt m
+  | inl r => exec_atomic_store aty dst r o rs stk code_id tail_call_cnt m
   | _ => Stuck
-  end. 
+  end.
 
 Definition exec_atomic_instr_event (aty: atomic_type): etrace :=
   [eBPF_vload].
 
 Inductive atomic_step (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_atomic_step:
-      forall c idx b ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty w dst src o,
+      forall c b ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty dst src o,
       rs PC = Vptr b ofs ->
-      (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      find_code code_id p = Some c ->
       find_instr (Ptrofs.unsigned ofs) c = Some (Patomic aty dst src o) ->
-      exec_atomic w aty dst src o rs stk code_id tail_call_cnt m = Next rs' stk' code_id' tail_call_cnt' m' ->
+      exec_atomic aty dst src o rs stk code_id tail_call_cnt m = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_atomic_instr_event aty = et ->
         atomic_step p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m').
   (*
@@ -1174,6 +1226,7 @@ Inductive nstep: tid -> state -> etrace -> state -> Prop :=
 Inductive astep: tid -> state -> etrace -> state -> Prop :=
   | At_step: forall tp cid ge gm d et rs stk code_id tail_call_cnt tp' rs' stk' code_id' tail_call_cnt' gm' blk,
     (tp_map tp) cid = Some (rs, blk) ->
+    update_core tp cid rs' = tp' ->
     atomic_step (fst (ge blk)) (TLS_State rs stk code_id tail_call_cnt gm) et (TLS_State rs' stk' code_id' tail_call_cnt' gm') ->
       astep cid (mkBuild_state tp ge gm d) et 
                 (mkBuild_state tp' ge gm' d).

@@ -189,12 +189,18 @@ Inductive call_type : Type :=
   OR        0x40   atomic or
   AND       0x50   atomic and
   XOR       0xa0   atomic xor
+  FETCH     0x01   modifier: the old value is written back to src
+  XCHG      0xe1   (0xe0 | FETCH) atomic exchange
+  CMPXCHG   0xf1   (0xf0 | FETCH) atomic compare and exchange
+
+  [is_db]: 64-bit ([BPF_DW]) if true, 32-bit ([BPF_W]) otherwise.
+  [fetch]: the [BPF_FETCH] modifier.
 *)
 Inductive atomic_type : Type :=
-  | AtomicADD (is_db: bool)
-  | AtomicOR  (is_db: bool)
-  | AtomicAND (is_db: bool)
-  | AtomicXOR (is_db: bool)
+  | AtomicADD (is_db fetch: bool)
+  | AtomicOR  (is_db fetch: bool)
+  | AtomicAND (is_db fetch: bool)
+  | AtomicXOR (is_db fetch: bool)
   | AtomicXCHG (is_db: bool)
   | AtomicCMPXCHG (is_db: bool)
   | LOAD_ACQUIRE (sz:sizeOp)

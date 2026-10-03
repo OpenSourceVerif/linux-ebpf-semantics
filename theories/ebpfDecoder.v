@@ -227,6 +227,30 @@ Definition decode_insn (opcode : byte) (dst_reg src_reg : ireg) (off : Ptrofs.in
         else None
       | None => None
       end
+    else if is_stx && Z.eqb (Z.shiftr op_val 5) 0x6 then (* Mode = ATOMIC (0xc0) *)
+      let sz := Z.land (Z.shiftr op_val 3) 0x3 in (* Size bits 3-4: W or DW only *)
+      let is_db := match sz with
+                   | 0x0 => Some false
+                   | 0x3 => Some true
+                   | _ => None
+                   end in
+      match is_db with
+      | Some db =>
+        match Int.unsigned imm with
+        | 0x00 => Some (Patomic (AtomicADD db false) dst_reg (inl src_reg) off)
+        | 0x01 => Some (Patomic (AtomicADD db true)  dst_reg (inl src_reg) off)
+        | 0x40 => Some (Patomic (AtomicOR  db false) dst_reg (inl src_reg) off)
+        | 0x41 => Some (Patomic (AtomicOR  db true)  dst_reg (inl src_reg) off)
+        | 0x50 => Some (Patomic (AtomicAND db false) dst_reg (inl src_reg) off)
+        | 0x51 => Some (Patomic (AtomicAND db true)  dst_reg (inl src_reg) off)
+        | 0xa0 => Some (Patomic (AtomicXOR db false) dst_reg (inl src_reg) off)
+        | 0xa1 => Some (Patomic (AtomicXOR db true)  dst_reg (inl src_reg) off)
+        | 0xe1 => Some (Patomic (AtomicXCHG db)      dst_reg (inl src_reg) off)
+        | 0xf1 => Some (Patomic (AtomicCMPXCHG db)   dst_reg (inl src_reg) off)
+        | _ => None (* load-acquire / store-release: not modelled *)
+        end
+      | None => None
+      end
 
     else None
   else
