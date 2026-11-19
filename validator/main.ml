@@ -118,17 +118,39 @@ let parse_single_program prog_node =
 let load_traces_from_json trace_root filename =
   let path = Filename.concat trace_root (filename ^ ".json") in
   let json = Yojson.Safe.from_file path in
-  json |> to_list |> List.map parse_single_program
+  to_list json
+
+let parse_helper_return = function
+  | `Int i when i >= 0 -> Stdlib.Int64.of_int i
+  | `Intlit s | `String s ->
+      (* OCaml uses 0u for decimal inputs spanning the full uint64 range. *)
+      let literal =
+        if String.starts_with ~prefix:"0x" s || String.starts_with ~prefix:"0X" s
+        then s else "0u" ^ s
+      in
+      (try Stdlib.Int64.of_string literal
+       with Failure _ -> failwith ("Invalid uint64: " ^ s))
+  | _ -> failwith "Expected an unsigned 64-bit integer"
+
+let validate_helper_event spec event =
+  match spec.helper_post with
+  | MemoryPost _ -> None  (* Requires reconstructed registers and memory. *)
+  | NoMemoryEffect _ ->
+      if member "premem" event <> `List [] || member "postmem" event <> `List []
+         || member "map_effect" event <> `Null then Some false
+      else
+        let ret = event |> member "ret" |> parse_helper_return in
+        helper_validation spec None (Vlong (compcert_int64_of_native ret)) SameMemory
+
+let read_helper_events run = run |> member "helper_events" |> to_list
+
+let capture_complete node = member "capture_status" node = `String "complete"
 
 (* ========================================== *)
 (* 3. Main Testing Program *)
 (* ========================================== *)
 
-let run_test trace_root filename verbose =
-  Debug_printer.init_hooks verbose;
-  if verbose then Printf.printf "Loading JSON traces from %s...\n" filename;
-  
-  let programs = load_traces_from_json trace_root filename in
+let validate_legacy_traces filename verbose programs =
   let total_progs = List.length programs in
   
   if verbose then Printf.printf "[Info] Successfully loaded %d programs.\n\n" total_progs;
@@ -179,6 +201,48 @@ let run_test trace_root filename verbose =
     flush stdout
   end;
   (!passed_count, total_progs)
+
+let run_test trace_root filename verbose =
+  Debug_printer.init_hooks verbose;
+  if verbose then Printf.printf "Loading JSON traces from %s...\n" filename;
+  let runs = load_traces_from_json trace_root filename in
+  if List.exists (fun run -> List.mem_assoc "helper_events" (to_assoc run)) runs then begin
+    let event_count =
+      List.fold_left (fun count run -> count + List.length (read_helper_events run)) 0 runs
+    in
+    let complete_runs = List.filter capture_complete runs in
+    let complete_events =
+      List.concat_map read_helper_events complete_runs |> List.filter capture_complete
+    in
+    let distinct_ids =
+      complete_events
+      |> List.map (fun event -> event |> member "helper_id" |> to_int)
+      |> List.sort_uniq compare |> List.map string_of_int |> String.concat ", "
+    in
+    Printf.printf "[%s] Complete runs: %d / %d. Helper events with complete run and event capture: %d / %d (IDs: %s).\n%!"
+      filename (List.length complete_runs) (List.length runs)
+      (List.length complete_events) event_count
+      (if distinct_ids = "" then "none" else distinct_ids);
+    let passed, failed, unsupported =
+      List.fold_left (fun (passed, failed, unsupported) event ->
+        let id = event |> member "helper_id" |> to_int in
+        let verdict = Option.bind (find_helper (coq_Z_of_int id))
+                        (fun spec -> validate_helper_event spec event) in
+        match verdict with
+        | None -> (passed, failed, unsupported + 1)
+        | Some true -> (passed + 1, failed, unsupported)
+        | Some false ->
+            Printf.printf "[%s] Helper ID %d call %d violates its specification.\n%!"
+              filename id (event |> member "call_id" |> to_int);
+            (passed, failed + 1, unsupported)
+      ) (0, 0, 0) complete_events
+    in
+    Printf.printf "[%s] Helper checks: %d passed, %d failed. Unsupported helper calls: %d.\n%!"
+      filename passed failed unsupported;
+    (0, 0)
+  end else
+    let programs = List.map parse_single_program runs in
+    validate_legacy_traces filename verbose programs
 
 let parse_cli () =
   let trace_root = ref "trace" in
