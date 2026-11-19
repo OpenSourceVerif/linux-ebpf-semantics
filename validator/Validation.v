@@ -3,9 +3,35 @@ From Coq Require Import ZArith List String.
 From compcert Require Import Coqlib Ctypes AST Integers.
 From compcert Require Import Maps Values Memory.
 
-From bpf.semantics Require Import ebpfSyntax ebpfState ebpfDecoder ebpfBinSem.
+From bpf.semantics Require Import ebpfSyntax ebpfState ebpfDecoder ebpfBinSem ebpfHelper.
 
 Import ListNotations.
+
+(* SameMemory means reconstruction reused the entry memory. *)
+Inductive helper_post_memory :=
+  | SameMemory
+  | ObservedMemory (after: mem).
+
+(* entry is absent when only the scalar return has been decoded. *)
+Definition helper_validation (spec: helper_spec) (entry: option (regset * mem))
+    (result: val) (after: helper_post_memory) : option bool :=
+  let pre :=
+    match entry, helper_pre spec with
+    | Some (rs, m), _ => Some (helper_pre_holds spec rs m)
+    | None, None => Some true
+    | None, Some _ => None
+    end in
+  match pre with
+  | None => None
+  | Some false => Some false
+  | Some true =>
+      match helper_post spec, entry, after with
+      | NoMemoryEffect returns, _, SameMemory => Some (returns result)
+      | MemoryPost holds, Some (rs, m), ObservedMemory m' => Some (holds rs m result m')
+      | MemoryPost holds, Some (rs, m), SameMemory => Some (holds rs m result m)
+      | _, _, _ => None
+      end
+  end.
 
 Parameter force_eval : forall {A B : Type}, A -> B -> B.
 
