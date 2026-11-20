@@ -123,7 +123,8 @@ Definition decode_insn (opcode : byte) (dst_reg src_reg : ireg) (off : Ptrofs.in
         Some (Pcall CallInternal (Int.repr (Ptrofs.signed off)))
       else None
     else if Z.eqb code 0xf && is_jmp64 then (* JMP_TAIL_CALL *)
-      if check_dst_r0 && check_src_r0 && check_off_0 && check_imm_0 then Some Ptail_call else None
+      (* The immediate may contain JIT poke metadata, not a call target. *)
+      if check_dst_r0 && check_src_r0 && check_off_0 then Some Ptail_call else None
     else if Z.eqb code 0x8 && is_jmp64 && src_is_imm then (* CALL *)
       if check_off_0 then
         match src_reg with
