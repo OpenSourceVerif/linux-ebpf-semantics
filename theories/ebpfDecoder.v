@@ -123,11 +123,15 @@ Definition decode_insn (opcode : byte) (dst_reg src_reg : ireg) (off : Ptrofs.in
         Some (Pcall CallInternal (Int.repr (Ptrofs.signed off)))
       else None
     else if Z.eqb code 0xf && is_jmp64 then (* JMP_TAIL_CALL *)
-      if check_dst_r0 && check_src_r0 && check_off_0 && check_imm_0 then Some Ptail_call else None
+      (* The immediate may contain a JIT poke index; execution ignores it. *)
+      if check_dst_r0 && check_src_r0 && check_off_0 then Some Ptail_call else None
     else if Z.eqb code 0x8 && is_jmp64 && src_is_imm then (* CALL *)
       if check_off_0 then
         match src_reg with
-        | R0 => Some (Pcall CallByStaticID imm)
+        | R0 =>
+            (* BPF_FUNC_tail_call is also restored by bpf_insn_prepare_dump. *)
+            if Int.eq imm (Int.repr 12) then Some Ptail_call
+            else Some (Pcall CallByStaticID imm)
         | R1 => Some (Pcall CallInternal imm)
         | R2 => Some (Pcall CallByBTF imm)
         | _ => None

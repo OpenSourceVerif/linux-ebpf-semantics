@@ -760,7 +760,7 @@ Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk) (code_id: opti
   let (m', nsp) := Mem.alloc m 0 bpf_stack_size in
   Next
     ((def_caller_save_regs rs)
-      #PC <- (Val.offset_ptr (Val.offset_ptr (rs PC) (Ptrofs.of_int i)) Ptrofs.one)
+      #PC <- (Val.offset_ptr (Val.offset_ptr (rs PC) (Ptrofs.of_ints i)) Ptrofs.one)
       #R10 <- (Vptr nsp (Ptrofs.repr bpf_stack_size))) n_stk code_id tail_call_cnt m'.
 
 (*
@@ -966,29 +966,48 @@ Definition exec_instr_event (i: instruction) : etrace :=
   | _                     => eE0
   end.
 
+(** Quantify the selected index universally: choosing an unrelated index in a
+    rule constructor would leave the active program's code unconstrained. *)
 Inductive step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_step_internal:
-      forall c idx b ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
+      forall c b ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
       rs PC = Vptr b ofs ->
       (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
       find_instr (Ptrofs.unsigned ofs) c = Some i ->
       exec_instr p i rs stk code_id tail_call_cnt m addr_map = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_instr_event i = et ->
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m')
   | exec_step_external:
-      forall c idx b ofs cty i res rs stk code_id tail_call_cnt m rs' code_id' tail_call_cnt' m',
+      forall c b ofs cty i res rs stk code_id tail_call_cnt m rs' m',
       rs PC = Vptr b ofs ->
       (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
       find_instr (Ptrofs.unsigned ofs) c = Some (Pcall cty i) ->
       cty = CallByBTF \/ cty = CallByStaticID ->
       ebpf_call_function i rs#R1 rs#R2 rs#R3 rs#R4 rs#R5 (Next rs stk code_id tail_call_cnt m) = Some (res, m') -> (**r an ebpf call may invoke another ebpf program that modifies the global memory *)
-      rs' = nextinstr (undef_caller_save_regs rs)
-                #R0 <- res
-                #PC <- (Val.offset_ptr (rs#PC) Ptrofs.one) ->
-      step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id' tail_call_cnt' m')
+      rs' = (nextinstr (undef_caller_save_regs rs)) #R0 <- res ->
+      step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id tail_call_cnt m')
       .
+
+(** Returning external calls preserve the caller's control state. *)
+Lemma external_call_preserves_control_state:
+  forall addr_map p rs stk code_id tail_call_cnt m
+         rs' stk' code_id' tail_call_cnt' m',
+    step addr_map p
+      (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call]
+      (TLS_State rs' stk' code_id' tail_call_cnt' m') ->
+    stk' = stk /\ code_id' = code_id /\ tail_call_cnt' = tail_call_cnt.
+Proof.
+  intros addr_map p rs stk code_id tail_call_cnt m
+         rs' stk' code_id' tail_call_cnt' m' Hstep.
+  inversion Hstep; subst.
+  - match goal with
+    | H : exec_instr_event ?i = [eBPF_ext_call] |- _ =>
+        destruct i; discriminate H
+    end.
+  - auto.
+Qed.
 
 Inductive initial_lst_state (ctx blk stk: block): tls_state -> Prop :=
   | initial_lst_state_intro: forall m0 rs0,
@@ -1142,10 +1161,10 @@ Definition exec_atomic_instr_event (aty: atomic_type): etrace :=
 
 Inductive atomic_step (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_atomic_step:
-      forall c idx b ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty w dst src o,
+      forall c b ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty w dst src o,
       rs PC = Vptr b ofs ->
       (code_id = None -> c = (main_code p)) ->
-      (code_id = Some idx -> (jump_table p) idx = Some c) ->
+      (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
       find_instr (Ptrofs.unsigned ofs) c = Some (Patomic aty dst src o) ->
       exec_atomic w aty dst src o rs stk code_id tail_call_cnt m = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_atomic_instr_event aty = et ->
