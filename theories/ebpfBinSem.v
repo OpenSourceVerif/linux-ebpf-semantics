@@ -990,25 +990,6 @@ Inductive step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace 
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id tail_call_cnt m')
       .
 
-(** Returning external calls preserve the caller's control state. *)
-Lemma external_call_preserves_control_state:
-  forall addr_map p rs stk code_id tail_call_cnt m
-         rs' stk' code_id' tail_call_cnt' m',
-    step addr_map p
-      (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call]
-      (TLS_State rs' stk' code_id' tail_call_cnt' m') ->
-    stk' = stk /\ code_id' = code_id /\ tail_call_cnt' = tail_call_cnt.
-Proof.
-  intros addr_map p rs stk code_id tail_call_cnt m
-         rs' stk' code_id' tail_call_cnt' m' Hstep.
-  inversion Hstep; subst.
-  - match goal with
-    | H : exec_instr_event ?i = [eBPF_ext_call] |- _ =>
-        destruct i; discriminate H
-    end.
-  - auto.
-Qed.
-
 Inductive initial_lst_state (ctx blk stk: block): tls_state -> Prop :=
   | initial_lst_state_intro: forall m0 rs0,
       rs0 =
