@@ -16,6 +16,95 @@ From bpf.semantics Require Import GlobalSem ebpfSyntax ebpfState ebpfHelper.
 Import ListNotations.
 
 
+(** Regions are nonempty, representable, nonwrapping half-open intervals. *)
+Definition address_region_valid (r: addr_region): bool :=
+  (0 <? size_blk r) && (size_blk r <=? Ptrofs.modulus) &&
+  (Int64.unsigned (base_addr r) + size_blk r <=? Int64.modulus).
+
+Fixpoint find_address_region (b: block) (regions: list addr_region): option addr_region :=
+  match regions with
+  | [] => None
+  | r :: rest => if Pos.eqb (base_blk r) b then Some r
+                 else find_address_region b rest
+  end.
+
+Definition region_pointer (word: int64) (r: addr_region): option val :=
+  let offset := Int64.unsigned word - Int64.unsigned (base_addr r) in
+  if address_region_valid r && (0 <=? offset) && (offset <? size_blk r)
+  then Some (Vptr (base_blk r) (Ptrofs.repr offset)) else None.
+
+(** Reverse conversion rejects one-past and out-of-region offsets. *)
+Definition cast_address_abs_to_concrete (ptr: val) (regions: list addr_region): option int64 :=
+  match ptr with
+  | Vptr b ofs =>
+      match find_address_region b regions with
+      | None => None
+      | Some r =>
+          let offset := Ptrofs.unsigned ofs in
+          if address_region_valid r && (0 <=? offset) && (offset <? size_blk r)
+          then Some (Int64.repr (Int64.unsigned (base_addr r) + offset))
+          else None
+      end
+  | _ => None
+  end.
+
+(** A stack top is an address boundary, not a dereferenceable pointer.
+    Construct it explicitly; do not weaken reverse conversion to admit it. *)
+Definition stack_top_word (b: block) (size: Z) (regions: list addr_region): option int64 :=
+  match find_address_region b regions with
+  | Some r =>
+      let top := Int64.unsigned (base_addr r) + size in
+      if address_region_valid r && (size_blk r =? size) && (top <? Int64.modulus)
+      then Some (Int64.repr top) else None
+  | None => None
+  end.
+
+(** Ignore unallocated or freed regions, including reserved future stack frames.
+    Mem.load/store still check the full access width, alignment and permissions. *)
+Fixpoint word_pointer_candidates (m: mem) (word: int64)
+    (regions: list addr_region): list val :=
+  match regions with
+  | [] => []
+  | r :: rest =>
+      let candidates := word_pointer_candidates m word rest in
+      match region_pointer word r with
+      | Some (Vptr b ofs) =>
+          if Mem.valid_pointer m b (Ptrofs.unsigned ofs)
+          then Vptr b ofs :: candidates else candidates
+      | _ => candidates
+      end
+  end.
+
+(** Ambiguous live mappings are rejected, never resolved by list order. *)
+Definition cast_i2p (m: mem) (word: int64) (regions: list addr_region): option val :=
+  match word_pointer_candidates m word regions with
+  | [ptr] => Some ptr
+  | _ => None
+  end.
+
+Definition add_word_offset (v: val) (ofs: ptrofs): val :=
+  Val.addl v (Vlong (Int64.repr (Ptrofs.signed ofs))).
+
+Definition resolve_address (m: mem) (v: val) (ofs: ptrofs)
+    (regions: list addr_region): option val :=
+  match add_word_offset v ofs with
+  | Vlong word => cast_i2p m word regions
+  | _ => None
+  end.
+
+(** Normalize complete values at memory and external-call boundaries.
+    Undefined values remain undefined; no pointer enters the register file. *)
+Definition register_word (v: val) (regions: list addr_region): option val :=
+  match v with
+  | Vlong _ | Vundef => Some v
+  | Vint i => Some (Vlong (Int64.repr (Int.unsigned i)))
+  | Vptr _ _ =>
+      match cast_address_abs_to_concrete v regions with
+      | Some word => Some (Vlong word) | None => None
+      end
+  | _ => None
+  end.
+
 Section RELSEM.
 
 (** Looking up instructions in a code sequence by position. *)
@@ -69,7 +158,7 @@ Variable helper_id_at: ebpf_prog -> option nat -> Z -> option Z.
 (** Manipulations over the [PC] register: continuing with the next
   instruction ([nextinstr]) or branching to a label ([goto_label]). *)
 Definition nextinstr (rs: regset) :=
-  rs#PC <- (Val.offset_ptr rs#PC Ptrofs.one).
+  rs#PC <- (Val.addl rs#PC (Vlong Int64.one)).
 
 (*
 Definition goto_label (f: function) (lbl: label) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
@@ -112,7 +201,7 @@ Definition eval_reg_immw (w:width) (rs : regset) (ri: ireg+int) : val :=
 
 Definition eval_val_int (w:width)  (ri: val+int) : val :=
   match ri with
-  | inl i => i (** we assume each eBPF register is 64-bit: i.e.` Vlong vl` or `Vptr b ofs` *)
+  | inl i => i (** we assume each eBPF register is 64-bit: i.e. Vlong or Vundef *)
   | inr i => match w with
              | W32 => Vint i
              | W64 => Vlong (int64_of_int i)
@@ -449,10 +538,10 @@ Definition eval_cmp64 (op: cmpOp) (rs: regset) (m: mem) (r: ireg) (ri: ireg+imm)
     end.
 
 Definition exec_jmp32 (i: imm) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  Next (nextinstr (rs#PC <- (Val.offset_ptr (rs PC) (Ptrofs.of_ints i)))) c_stk code_id tail_call_cnt m.
+  Next (nextinstr (rs#PC <- (Val.addl (rs PC) (Vlong (Int64.repr (Int.signed i)))))) c_stk code_id tail_call_cnt m.
 
 Definition exec_jmp64 (o: off) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  Next (nextinstr (rs#PC <- (Val.offset_ptr (rs PC) o))) c_stk code_id tail_call_cnt m.
+  Next (nextinstr (rs#PC <- (add_word_offset (rs PC) o))) c_stk code_id tail_call_cnt m.
 
 Definition eval_cmp_static (op: cmpOp) (w: width) (r: ireg) (ri: ireg+imm) : option bool :=
   match ri with
@@ -498,7 +587,7 @@ Definition exec_jmpcmp (op: cmpOp) (w: width) (r: ireg) (ri: ireg+imm) (o: off) 
     end with
   | None => Stuck
   | Some cond => 
-    let rs' := if cond then rs#PC <- (Val.offset_ptr (rs PC) o) else rs in
+    let rs' := if cond then rs#PC <- (add_word_offset (rs PC) o) else rs in
       Next (nextinstr rs') c_stk code_id tail_call_cnt m
   end.
 
@@ -514,17 +603,7 @@ Definition exec_jmpcmp (op: cmpOp) (w: width) (r: ireg) (ri: ireg+imm) (o: off) 
  *)
 
  
-Fixpoint cast_i2p (v: int64) (addr_map: list addr_region): option val :=
-  match addr_map with
-  | [] => None
-  | h :: t =>
-    let upper := Int64.add (base_addr h) (Int64.repr (size_blk h)) in
-    let ofs   := Ptrofs.of_int64 (Int64.sub v (base_addr h)) in
-      if (Int64.cmpu Cle (base_addr h) v) && (Int64.cmpu Clt v upper) then
-        Some (Vptr (base_blk h) ofs)
-      else
-        cast_i2p v t
-  end.
+
 
   (*
 (** TODO: pseudo_ptr_ty should be used following the implementation of resolve_pseudo_ldimm64 in verifier.c  *)
@@ -577,27 +656,31 @@ Definition load_value_casting (v: val): val :=
   | _ => v
   end.
 
-Definition exec_load (k: sizeOp) (r:ireg) (r':ireg) (o:Ptrofs.int) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) :=
-  match
-    match rs#r' with
-    | Vlong vl =>
-      cast_i2p (Int64.add vl (Int64.repr (Ptrofs.signed o))) addr_map
-    | Vptr _ _ => Some (Val.offset_ptr rs#r' o)
-    | _ => None
-    end with
-  | None => Stuck
-  | Some addr =>
-    match load k addr m with
-    | None => Stuck
-    | Some v => Next (nextinstr (rs#r <- (load_value_casting v))) c_stk code_id tail_call_cnt m
-    end
+Definition load_result (signed: bool) (v: val) (addr_map: list addr_region): option val :=
+  match v with
+  | Vint i => Some (Vlong (Int64.repr (if signed then Int.signed i else Int.unsigned i)))
+  | _ => register_word v addr_map
   end.
 
-Definition exec_load_probe (k: sizeOp) (r:ireg) (r':ireg) (o:Ptrofs.int) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  match load k (Val.offset_ptr rs#r' o) m with
-  | None =>   Next (nextinstr (rs#r <- (Vlong Int64.zero))) c_stk code_id tail_call_cnt m
-  | Some v => Next (nextinstr (rs#r <- (load_value_casting v))) c_stk code_id tail_call_cnt m
+Definition exec_memory_load (read: sizeOp -> val -> mem -> option val)
+    (signed probe: bool) (k: sizeOp) (r r': ireg) (o: off)
+    (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat)
+    (m: mem) (addr_map: list addr_region): outcome :=
+  let loaded := match resolve_address m (rs r') o addr_map with
+                | Some addr => read k addr m | None => None end in
+  match loaded with
+  | None => if probe then
+      Next (nextinstr (rs#r <- (Vlong Int64.zero))) c_stk code_id tail_call_cnt m
+      else Stuck
+  | Some v => match load_result signed v addr_map with
+      | Some word => Next (nextinstr (rs#r <- word)) c_stk code_id tail_call_cnt m
+      | None => Stuck
+      end
   end.
+
+Definition exec_load := exec_memory_load load false false.
+
+Definition exec_load_probe := exec_memory_load load false true.
 
 Definition loadsx (k: sizeOp) (addr:val) (m: mem) :=
   match k with
@@ -614,11 +697,7 @@ Definition load_value_sx_casting (v: val): val :=
   | _ => v
   end.
 
-Definition exec_loadsx (k: sizeOp) (r:ireg) (r':ireg) (o:Ptrofs.int) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-    match loadsx k (Val.offset_ptr rs#r' o) m with
-    | None => Stuck
-    | Some v => Next (nextinstr (rs#r <- (load_value_sx_casting v))) c_stk code_id tail_call_cnt m
-    end.
+Definition exec_loadsx := exec_memory_load loadsx true false.
 
 Definition loadsx_probe (k: sizeOp) (addr:val) (m: mem) :=
   match k with
@@ -629,11 +708,11 @@ Definition loadsx_probe (k: sizeOp) (addr:val) (m: mem) :=
   (* if Archi.ptr64 then Mem.loadv Mint64 m addr else None *)
   end.
 
-Definition exec_loadsx_probe (k: sizeOp) (r:ireg) (r':ireg) (o:Ptrofs.int) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-    match loadsx_probe k (Val.offset_ptr rs#r' o) m with
-    | None => Stuck
-    | Some v => Next (nextinstr (rs#r <- (load_value_sx_casting v))) c_stk code_id tail_call_cnt m
-    end.
+Definition exec_loadsx_probe (k: sizeOp) :=
+  match k with
+  | DBWord => exec_memory_load loadsx true false k
+  | _ => exec_memory_load loadsx true true k
+  end.
 
 Definition store (k: sizeOp) (addr:val) (v:val) (m: mem) :=
   match k with
@@ -644,24 +723,23 @@ Definition store (k: sizeOp) (addr:val) (v:val) (m: mem) :=
   (*if Archi.ptr64 then Mem.storev Mint64 m addr v else None *)
   end.
 
-Definition exec_store (k: sizeOp) (r:ireg) (ri:ireg+int) (o:Ptrofs.int) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  match store k (Val.offset_ptr rs#r o) (eval_reg_immw (sizew k) rs ri) m with
+Definition exec_store (k: sizeOp) (r:ireg) (ri:ireg+int) (o:off)
+    (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat)
+    (m: mem) (addr_map: list addr_region): outcome :=
+  match resolve_address m (rs r) o addr_map with
   | None => Stuck
-  | Some m' => Next (nextinstr rs) c_stk code_id tail_call_cnt m'
+  | Some addr =>
+      match store k addr (eval_reg_immw (sizew k) rs ri) m with
+      | None => Stuck
+      | Some m' => Next (nextinstr rs) c_stk code_id tail_call_cnt m'
+      end
   end.
 
-Definition exec_lddw (ty: pseudo_ptr_ty) (r:ireg) (lo hi: imm) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) :=
-  let v := Int64.ofwords hi lo in
-    match ty with
-    | PSEUDO_Constant =>
-      Next (nextinstr (nextinstr (rs#r <- (Vlong v)))) c_stk code_id tail_call_cnt m
-    | _ =>
-      match cast_i2p v addr_map with
-      | None => Stuck (** something is wrong *)
-      | Some vp => (** it is a vptr b ofs *)
-        Next (nextinstr (nextinstr (rs#r <- vp))) c_stk code_id tail_call_cnt m
-      end
-    end.
+Definition exec_lddw (ty: pseudo_ptr_ty) (r:ireg) (lo hi: imm)
+    (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat)
+    (m: mem) (addr_map: list addr_region): outcome :=
+  Next (nextinstr (nextinstr (rs#r <- (Vlong (Int64.ofwords hi lo)))))
+    c_stk code_id tail_call_cnt m.
 
 (** Undefine all ebpf caller-saved registers: i.e. R1 to R5 *)
 Definition undef_caller_save_regs (rs: regset) : regset :=
@@ -674,14 +752,15 @@ Definition undef_caller_save_regs (rs: regset) : regset :=
 (** Check a helper transition against its precondition and postcondition.
     For trace validation, the caller supplies both memories in a shared
     block layout, using the observed bytes of a single call. *)
-Inductive exec_helper (id: Z) (result: val) (rs: regset) (stk: cstk)
+Inductive exec_helper (addr_map: list addr_region) (id: Z) (result: val) (rs: regset) (stk: cstk)
     (code_id: option nat) (tail_call_cnt: nat) (m m': mem): outcome -> Prop :=
-  | exec_helper_intro: forall spec,
+  | exec_helper_intro: forall spec word,
       find_helper id = Some spec ->
       helper_pre_holds spec rs m = true ->
       helper_post_holds spec rs m result m' ->
-      exec_helper id result rs stk code_id tail_call_cnt m m'
-        (Next (nextinstr ((undef_caller_save_regs rs)#R0 <- result))
+      register_word result addr_map = Some word ->
+      exec_helper addr_map id result rs stk code_id tail_call_cnt m m'
+        (Next (nextinstr ((undef_caller_save_regs rs)#R0 <- word))
           stk code_id tail_call_cnt m').
 
 (** Undefine all ebpf registers except caller-saved registers (i.e. R1 to R5) and R10 *)
@@ -766,20 +845,20 @@ Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk) (code_id: opti
     end.
 *)
 
-Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  let n_stk := {|
-    stk_ra := Val.offset_ptr rs#PC Ptrofs.one;
-    stk_r6 := rs R6;
-    stk_r7 := rs R7;
-    stk_r8 := rs R8;
-    stk_r9 := rs R9;
-    stk_r10 := rs R10;
-  |} :: c_stk in
-  let (m', nsp) := Mem.alloc m 0 bpf_stack_size in
-  Next
-    ((def_caller_save_regs rs)
-      #PC <- (Val.offset_ptr (Val.offset_ptr (rs PC) (Ptrofs.of_ints i)) Ptrofs.one)
-      #R10 <- (Vptr nsp (Ptrofs.repr bpf_stack_size))) n_stk code_id tail_call_cnt m'.
+Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk)
+    (code_id: option nat) (tail_call_cnt: nat) (m: mem)
+    (addr_map: list addr_region): outcome :=
+  let (m', frame) := Mem.alloc m 0 bpf_stack_size in
+  match stack_top_word frame bpf_stack_size addr_map with
+  | None => Stuck
+  | Some top =>
+      let saved := {| stk_ra := Val.addl (rs PC) (Vlong Int64.one);
+        stk_r6 := rs R6; stk_r7 := rs R7; stk_r8 := rs R8;
+        stk_r9 := rs R9; stk_r10 := rs R10 |} in
+      Next ((def_caller_save_regs rs)
+        #PC <- (Val.addl (Val.addl (rs PC) (Vlong (Int64.repr (Int.signed i)))) (Vlong Int64.one))
+        #R10 <- (Vlong top)) (saved :: c_stk) code_id tail_call_cnt m'
+  end.
 
 (*
 Definition reload_callee_save_registers (ofs_r6 ofs_r7 ofs_r8 ofs_r9: ptrofs)
@@ -834,43 +913,45 @@ Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_
   end.
 *)
 
-Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
+Definition exit_pc := Vundef.
+
+Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat)
+    (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region): outcome :=
   match c_stk with
-  | [] => Next (rs#PC <- Vnullptr) c_stk code_id tail_call_cnt m (**r rs#R0 includes the return value *)
-  | h :: tl_stk =>
-    match rs R10 with
-    | Vptr b ofs =>
-      match Mem.free m b 0 bpf_stack_size with
+  | [] => Next (rs#PC <- exit_pc) [] code_id tail_call_cnt m
+  | saved :: rest =>
+      (* R10 is one-past the current frame; resolve its base instead. *)
+      let freed :=
+        match resolve_address m (rs R10) (Ptrofs.repr (-bpf_stack_size)) addr_map with
+        | Some (Vptr frame ofs) =>
+            match find_address_region frame addr_map with
+            | Some region =>
+                if Ptrofs.eq ofs Ptrofs.zero && Z.eqb (size_blk region) bpf_stack_size
+                then Mem.free m frame 0 bpf_stack_size else None
+            | None => None
+            end
+        | _ => None
+        end in
+      match freed with
       | None => Stuck
-      | Some m' =>
-        Next
-          (undef_caller_save_regs rs)
-          #PC <- (stk_ra h)
-          #R6 <- (stk_r6 h)
-          #R7 <- (stk_r7 h)
-          #R8 <- (stk_r8 h)
-          #R9 <- (stk_r9 h)
-          #R10 <- (stk_r10 h) tl_stk code_id tail_call_cnt m'
+      | Some m' => Next ((undef_caller_save_regs rs)
+          #PC <- (stk_ra saved) #R6 <- (stk_r6 saved) #R7 <- (stk_r7 saved)
+          #R8 <- (stk_r8 saved) #R9 <- (stk_r9 saved) #R10 <- (stk_r10 saved))
+          rest code_id tail_call_cnt m'
       end
-    | _ => Stuck
-    end
   end.
 
 Definition MAX_TAIL_CALL_CNT: nat := 33.
 
-Definition exec_tail_call_addr (r2: val) (addr_map: list addr_region): option val :=
-  match r2 with
-  | Vptr b ofs => Some r2
-  | Vlong vl => cast_i2p vl addr_map
-  | _ => None
-  end.
+Definition exec_tail_call_addr (m: mem) (r2: val) (addr_map: list addr_region): option val :=
+  resolve_address m r2 Ptrofs.zero addr_map.
 
 Definition exec_tail_call (p: ebpf_prog) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) :=
   match rs R3 with
   | Vlong i =>
     (* The Linux interpreter converts R3 to u32 before the bounds check and lookup. *)
     let index := Int64.zero_ext 32 i in
-    match exec_tail_call_addr (rs R2) addr_map with
+    match exec_tail_call_addr m (rs R2) addr_map with
     | None => Stuck
     | Some r2_ptr =>
       match r2_ptr with
@@ -884,9 +965,15 @@ Definition exec_tail_call (p: ebpf_prog) (rs: regset) (c_stk: cstk) (code_id: op
           match Mem.loadv Mint64 m (Val.offset_ptr r2_ptr (Ptrofs.of_int64u (Int64.mul index (Int64.repr 8%Z)))) with
           | None => Next (nextinstr rs) c_stk code_id next_tail_call_cnt m
           | Some res =>
-            match res with
-            | Vptr b' ofs' =>
-              Next (rs#PC <- res) c_stk (Some (Z.to_nat (Int64.unsigned index))) next_tail_call_cnt m
+            match register_word res addr_map with
+            | Some (Vlong target) =>
+                if Int64.eq target Int64.zero then
+                  Next (nextinstr rs) c_stk code_id next_tail_call_cnt m
+                else match jump_table p (Z.to_nat (Int64.unsigned index)) with
+                | Some _ => Next (rs#PC <- (Vlong Int64.zero)) c_stk
+                    (Some (Z.to_nat (Int64.unsigned index))) next_tail_call_cnt m
+                | None => Stuck
+                end
             | _ => Next (nextinstr rs) c_stk code_id next_tail_call_cnt m
             end
           end
@@ -906,19 +993,19 @@ Definition exec_tail_call (p: ebpf_prog) (rs: regset) (c_stk: cstk) (code_id: op
 Definition exec_instr (p: ebpf_prog) (i: instruction) (rs:regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) : outcome :=
   match i with
   | Plddw ty r lo hi         => exec_lddw ty r lo hi rs c_stk code_id tail_call_cnt m addr_map
-  | Ploadsx k r r' o         => exec_loadsx k r r' o rs c_stk code_id tail_call_cnt m
-  | Pload_probe k r r' o     => exec_load_probe k r r' o rs c_stk code_id tail_call_cnt m
-  | Ploadsx_probe k r r' o   => exec_loadsx_probe k r r' o rs c_stk code_id tail_call_cnt m
+  | Ploadsx k r r' o         => exec_loadsx k r r' o rs c_stk code_id tail_call_cnt m addr_map
+  | Pload_probe k r r' o     => exec_load_probe k r r' o rs c_stk code_id tail_call_cnt m addr_map
+  | Ploadsx_probe k r r' o   => exec_loadsx_probe k r r' o rs c_stk code_id tail_call_cnt m addr_map
   | Pno_spec              => Next (nextinstr rs) c_stk code_id tail_call_cnt m
   | Ptail_call            => exec_tail_call p rs c_stk code_id tail_call_cnt m addr_map
   | Pload k r r' o        => exec_load k r r' o rs c_stk code_id tail_call_cnt m addr_map
-  | Pstore k r ri o       => exec_store k r ri o rs c_stk code_id tail_call_cnt m
+  | Pstore k r ri o       => exec_store k r ri o rs c_stk code_id tail_call_cnt m addr_map
   | Palu op w r ri        => exec_alu op w r ri rs c_stk code_id tail_call_cnt m
   | Pjmp32 i              => exec_jmp32 i rs c_stk code_id tail_call_cnt m
   | Pjmp64 o              => exec_jmp64 o rs c_stk code_id tail_call_cnt m
   | Pjmpcmp op w r ri o   => exec_jmpcmp op w r ri o rs c_stk code_id tail_call_cnt m
-  | Pcall CallInternal i  => exec_call_internal i rs c_stk code_id tail_call_cnt m
-  | Pret                  => exec_ret rs c_stk code_id tail_call_cnt m
+  | Pcall CallInternal i  => exec_call_internal i rs c_stk code_id tail_call_cnt m addr_map
+  | Pret                  => exec_ret rs c_stk code_id tail_call_cnt m addr_map
   | _                     => Stuck
   end.
 
@@ -986,88 +1073,65 @@ Definition exec_instr_event (i: instruction) : etrace :=
 
 Inductive step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_step_internal:
-      forall c b ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
-      rs PC = Vptr b ofs ->
+      forall c ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
+      rs PC = Vlong ofs ->
       (code_id = None -> c = (main_code p)) ->
       (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
-      find_instr (Ptrofs.unsigned ofs) c = Some i ->
+      find_instr (Int64.unsigned ofs) c = Some i ->
       exec_instr p i rs stk code_id tail_call_cnt m addr_map = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_instr_event i = et ->
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m')
   | exec_step_helper:
-      forall c b ofs i id res rs stk code_id tail_call_cnt m rs' m',
-      rs PC = Vptr b ofs ->
+      forall c ofs i id res rs stk code_id tail_call_cnt m rs' m',
+      rs PC = Vlong ofs ->
       (match code_id with
        | None => Some (main_code p)
        | Some idx => (jump_table p) idx
        end) = Some c ->
-      find_instr (Ptrofs.unsigned ofs) c = Some (Pcall CallByStaticID i) ->
-      helper_id_at p code_id (Ptrofs.unsigned ofs) = Some id ->
-      exec_helper id res rs stk code_id tail_call_cnt m m'
+      find_instr (Int64.unsigned ofs) c = Some (Pcall CallByStaticID i) ->
+      helper_id_at p code_id (Int64.unsigned ofs) = Some id ->
+      exec_helper addr_map id res rs stk code_id tail_call_cnt m m'
         (Next rs' stk code_id tail_call_cnt m') ->
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call]
         (TLS_State rs' stk code_id tail_call_cnt m')
   | exec_step_external:
-      forall c b ofs cty i res rs stk code_id tail_call_cnt m rs' m',
-      rs PC = Vptr b ofs ->
+      forall c ofs cty i res word rs stk code_id tail_call_cnt m rs' m',
+      rs PC = Vlong ofs ->
       (code_id = None -> c = (main_code p)) ->
       (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
-      find_instr (Ptrofs.unsigned ofs) c = Some (Pcall cty i) ->
+      find_instr (Int64.unsigned ofs) c = Some (Pcall cty i) ->
       cty = CallByBTF ->
       ebpf_call_function i rs#R1 rs#R2 rs#R3 rs#R4 rs#R5 (Next rs stk code_id tail_call_cnt m) = Some (res, m') -> (**r an ebpf call may invoke another ebpf program that modifies the global memory *)
-      rs' = (nextinstr (undef_caller_save_regs rs)) #R0 <- res ->
+      register_word res addr_map = Some word ->
+      rs' = (nextinstr (undef_caller_save_regs rs)) #R0 <- word ->
       step addr_map p (TLS_State rs stk code_id tail_call_cnt m) [eBPF_ext_call] (TLS_State rs' stk code_id tail_call_cnt m')
       .
 
-Inductive initial_lst_state (ctx blk stk: block): tls_state -> Prop :=
-  | initial_lst_state_intro: forall m0 rs0,
-      rs0 =
-        (Pregmap.init Vundef)
-          # PC <- (Vptr blk Ptrofs.zero)
-          # R10 <- (Vptr stk (Ptrofs.repr bpf_stack_size))
-          # R1 <- (Vptr ctx Ptrofs.zero)
-          (* # BP  <- Vnullptr *) ->
-      (forall i, 0<= i -> i < bpf_stack_size -> Mem.valid_access m0 Mint8unsigned stk i Freeable) -> (**r access to [0, 512) *)
-      (*    
-      (forall i, 0<= i -> i < bpf_stack_size+6*8 -> Mem.valid_access m0 Mint8unsigned stk i Freeable) -> (**r access to [0, 512*8) *)
-      (forall i, 0<= i -> i < bpf_stack_size \/ (i <= bpf_stack_size+2*8 /\ i < bpf_stack_size+6*8) -> Mem.load Mint8unsigned m0 blk i = Some Vundef) -> (**r the init content of [0, 512) + r6-r9 are all Vundef *)
-      Mem.load Mint64 m0 blk bpf_stack_size = Some Vnullptr -> (**r the init old_ra is Vnullptr *)
-      Mem.load Mint64 m0 blk (bpf_stack_size+1*8) = Some Vnullptr -> (**r the init old_sp is Vnullptr *) *)
-      initial_lst_state ctx blk stk (TLS_State rs0 [] None 0 m0).
+Inductive initial_lst_state (addr_map: list addr_region) (ctx stk: block): tls_state -> Prop :=
+  | initial_lst_state_intro: forall m rs ctx_word top,
+      cast_address_abs_to_concrete (Vptr ctx Ptrofs.zero) addr_map = Some ctx_word ->
+      stack_top_word stk bpf_stack_size addr_map = Some top ->
+      rs = (Pregmap.init Vundef)#PC <- (Vlong Int64.zero)
+             #R10 <- (Vlong top) #R1 <- (Vlong ctx_word) ->
+      (forall i, 0 <= i -> i < bpf_stack_size -> Mem.valid_access m Mint8unsigned stk i Freeable) ->
+      initial_lst_state addr_map ctx stk (TLS_State rs [] None 0 m).
 
 (* TODO: not sure here: the return value R0 could be a pointer (Vptr b ofs) or (Vlong int64) *)
-Inductive final_lst_state (stk: block): tls_state -> val -> Prop :=
-  | final_lst_state_intro: forall rs m t k r,
-      rs PC = Vnullptr ->
-      rs R0 = r ->
-      (match r with | Vlong _ | Vptr _ _ => True | _ => False end) ->
-      rs R10 = Vptr stk (Ptrofs.repr bpf_stack_size) ->
-      (forall i, 0<= i -> i < bpf_stack_size -> Mem.valid_access m Mint8unsigned stk i Freeable) ->
-      final_lst_state stk (TLS_State rs [] t k m) r.
+Inductive final_lst_state (addr_map: list addr_region) (stk: block): tls_state -> val -> Prop :=
+  | final_lst_state_intro: forall rs m t k word top,
+      rs PC = exit_pc ->
+      rs R0 = Vlong word ->
+      stack_top_word stk bpf_stack_size addr_map = Some top ->
+      rs R10 = Vlong top ->
+      (forall i, 0 <= i -> i < bpf_stack_size -> Mem.valid_access m Mint8unsigned stk i Freeable) ->
+      final_lst_state addr_map stk (TLS_State rs [] t k m) (Vlong word).
 
-Definition is_final_state (stk_blk: block) (rs: regset) (m: mem) (stk : cstk): bool :=
-  let pc_b :=
-    match rs PC with
-    | Vlong i => (Int64.eq i Int64.zero) && Archi.ptr64
-    | Vint i => if Archi.ptr64 then false else (Int.eq i Int.zero)
-    | _ => false
-    end in
-  let r0_b :=
-    match rs R0 with
-    | Vlong _ | Vptr _ _ => true
-    | _ => false
-    end in
-  let r10_b :=
-    match rs R10 with
-    | Vptr b ofs => Pos.eqb b stk_blk && Ptrofs.eq ofs (Ptrofs.repr 512%Z)
-    | _ => false
-    end in
-    match stk with
-    | [] => pc_b && r0_b && r10_b
-    | _ => false
-    end
-  (** we don't check the memory here *)
-.
+Definition is_final_state (addr_map: list addr_region) (stk_blk: block)
+    (rs: regset) (m: mem) (stk: cstk): bool :=
+  match rs PC, rs R0, rs R10, stack_top_word stk_blk bpf_stack_size addr_map, stk with
+  | Vundef, Vlong _, Vlong sp, Some top, [] => Int64.eq sp top
+  | _, _, _, _, _ => false
+  end.
 
 Definition find_code (code_id:option nat) (bpf_prog: ebpf_prog): option code :=
   match code_id with
@@ -1082,14 +1146,14 @@ Fixpoint bpf_interpreter_old (fuel: nat) (bpf_prog: ebpf_prog) (st: outcome) (ad
     match st with
     | Stuck => None
     | Next rs stk code_id tail_call_cnt m =>
-      if is_final_state stk_blk rs m stk then Some (rs R0)
+      if is_final_state addr_map stk_blk rs m stk then Some (rs R0)
       else
         match rs PC with
-        | Vptr b ofs =>
+        | Vlong ofs =>
           match find_code code_id bpf_prog with
           | None => None
           | Some c =>
-            match find_instr (Ptrofs.unsigned ofs) c with
+            match find_instr (Int64.unsigned ofs) c with
             | None => None
             | Some i => bpf_interpreter_old k bpf_prog (exec_instr bpf_prog i rs stk code_id tail_call_cnt m addr_map) addr_map stk_blk
             end
@@ -1147,38 +1211,46 @@ Definition chunk_of_width (w: width) :=
   | W64 => Mint64
   end.
 
-Definition exec_atomic_store (w: width) (aty: atomic_type) (dst src: ireg) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
-  let addr := Val.offset_ptr (rs dst) o in
+Definition exec_atomic_store (w: width) (aty: atomic_type) (dst src: ireg) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region): outcome :=
   let sv := match w with W32 => Val.loword (rs src) | W64 => rs src end in
+  match resolve_address m (rs dst) o addr_map with
+  | None => Stuck
+  | Some addr =>
     match Mem.loadv (chunk_of_width w) m addr with
     | None => Stuck
-    | Some v =>
+    | Some raw =>
+      match register_word raw addr_map with
+      | None => Stuck
+      | Some word =>
+      let v := match w with W32 => Val.loword word | W64 => word end in
       let res := (atomic_fun w aty v sv) in
         match Mem.storev (chunk_of_width w) m addr res with
         | None => Stuck
         | Some m' => Next (nextinstr rs) stk code_id tail_call_cnt m'
         end
-    end.
+      end
+    end
+  end.
 
-Definition exec_atomic (w: width) (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+Definition exec_atomic (w: width) (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region): outcome :=
   match src with
-  | inl r => exec_atomic_store w aty dst r o rs stk code_id tail_call_cnt m
+  | inl r => exec_atomic_store w aty dst r o rs stk code_id tail_call_cnt m addr_map
   | _ => Stuck
   end. 
 
 Definition exec_atomic_instr_event (aty: atomic_type): etrace :=
   [eBPF_vload].
 
-Inductive atomic_step (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
+Inductive atomic_step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_atomic_step:
-      forall c b ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty w dst src o,
-      rs PC = Vptr b ofs ->
+      forall c ofs rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et aty w dst src o,
+      rs PC = Vlong ofs ->
       (code_id = None -> c = (main_code p)) ->
       (forall idx, code_id = Some idx -> (jump_table p) idx = Some c) ->
-      find_instr (Ptrofs.unsigned ofs) c = Some (Patomic aty dst src o) ->
-      exec_atomic w aty dst src o rs stk code_id tail_call_cnt m = Next rs' stk' code_id' tail_call_cnt' m' ->
+      find_instr (Int64.unsigned ofs) c = Some (Patomic aty dst src o) ->
+      exec_atomic w aty dst src o rs stk code_id tail_call_cnt m addr_map = Next rs' stk' code_id' tail_call_cnt' m' ->
       exec_atomic_instr_event aty = et ->
-        atomic_step p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m').
+        atomic_step addr_map p (TLS_State rs stk code_id tail_call_cnt m) et (TLS_State rs' stk' code_id' tail_call_cnt' m').
   (*
   | Switch_step: forall tp cid gm d cid' s s',
     (tp_map tp) cid = Some s -> (* valid eBPF thread id *)
@@ -1192,18 +1264,20 @@ Inductive atomic_step (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :
 
 Section eBPF_GlobalSem.
 
+Variable global_addr_map: list addr_region.
+
 Inductive nstep: tid -> state -> etrace -> state -> Prop :=
-  | Core_step: forall tp cid ge gm d et rs stk code_id tail_call_cnt tp' rs' stk' code_id' tail_call_cnt' gm' blk addr_map,
+  | Core_step: forall tp cid ge gm d et rs stk code_id tail_call_cnt tp' rs' stk' code_id' tail_call_cnt' gm' blk,
     (tp_map tp) cid = Some (rs, blk) ->
     update_core tp cid rs' = tp' ->
-    step addr_map (fst (ge blk)) (TLS_State rs stk code_id tail_call_cnt gm) et (TLS_State rs' stk' code_id' tail_call_cnt' gm') ->
+    step global_addr_map (fst (ge blk)) (TLS_State rs stk code_id tail_call_cnt gm) et (TLS_State rs' stk' code_id' tail_call_cnt' gm') ->
       nstep cid (mkBuild_state tp ge gm d) et 
                 (mkBuild_state tp' ge gm' d).
 
 Inductive astep: tid -> state -> etrace -> state -> Prop :=
   | At_step: forall tp cid ge gm d et rs stk code_id tail_call_cnt tp' rs' stk' code_id' tail_call_cnt' gm' blk,
     (tp_map tp) cid = Some (rs, blk) ->
-    atomic_step (fst (ge blk)) (TLS_State rs stk code_id tail_call_cnt gm) et (TLS_State rs' stk' code_id' tail_call_cnt' gm') ->
+    atomic_step global_addr_map (fst (ge blk)) (TLS_State rs stk code_id tail_call_cnt gm) et (TLS_State rs' stk' code_id' tail_call_cnt' gm') ->
       astep cid (mkBuild_state tp ge gm d) et 
                 (mkBuild_state tp' ge gm' d).
 
@@ -1213,11 +1287,11 @@ Definition is_atomic (cid: tid) (st: state): bool :=
   | Some (rs, blk) =>
     let (bpf_prog, code_id) := (env st) blk in
       match rs PC with
-      | Vptr b ofs =>
+      | Vlong ofs =>
         match find_code code_id bpf_prog with
         | None => false
         | Some c =>
-          match find_instr (Ptrofs.unsigned ofs) c with
+          match find_instr (Int64.unsigned ofs) c with
           | Some ins =>
             match ins with 
             | Patomic aty dst src offset => true
@@ -1237,20 +1311,20 @@ Definition read_address (cid: tid) (st: state): val -> Prop :=
     | Some (rs, blk) =>
       let (bpf_prog, code_id) := (env st) blk in
         match rs PC with
-        | Vptr b ofs =>
+        | Vlong ofs =>
           match find_code code_id bpf_prog with
           | None => False
           | Some c =>
-            match find_instr (Ptrofs.unsigned ofs) c with
+            match find_instr (Int64.unsigned ofs) c with
             | Some ins =>
               match ins with
               | Pload sz dst src offset =>
-                (Val.offset_ptr rs#src offset) = addr (*
+                (add_word_offset rs#src offset) = addr (*
               | Pstore sz dst src offset =>
-                (Val.offset_ptr rs#dst offset) = addr
+                (add_word_offset rs#dst offset) = addr
               | Patomic aty dst src offset =>
                 (* TODO: refine atomic instruction? *)
-                (Val.offset_ptr rs#dst offset) = addr *)
+                (add_word_offset rs#dst offset) = addr *)
               | _ => True
               end
             | None => False
@@ -1267,18 +1341,18 @@ Definition write_address (cid: tid) (st: state): val -> Prop :=
     | Some (rs, blk) =>
       let (bpf_prog, code_id) := (env st) blk in
         match rs PC with
-        | Vptr b ofs =>
+        | Vlong ofs =>
           match find_code code_id bpf_prog with
           | None => False
           | Some c =>
-            match find_instr (Ptrofs.unsigned ofs) c with
+            match find_instr (Int64.unsigned ofs) c with
             | Some ins =>
               match ins with
               | Pstore sz dst src offset =>
-                (Val.offset_ptr rs#dst offset) = addr
+                (add_word_offset rs#dst offset) = addr
               | Patomic aty dst src offset =>
                 (* TODO: refine atomic instruction? *)
-                (Val.offset_ptr rs#dst offset) = addr
+                (add_word_offset rs#dst offset) = addr
               | _ => True
               end
             | None => False
