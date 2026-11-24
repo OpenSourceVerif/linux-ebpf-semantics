@@ -26,6 +26,33 @@ Module BPF_SRC.
   Definition X : Z := 0x1. (* Register *)
 End BPF_SRC.
 
+(** Atomic mode uses the immediate as an operation selector, not a value.
+    Read/modify/write operations are restricted to 32 and 64 bits; acquire
+    and release also permit byte and halfword accesses. *)
+Definition decode_atomic (sz : Z) (imm : int) : option atomic_type :=
+  let width := if Z.eqb sz 3 then W64 else W32 in
+  let size := match sz with 0 => Word | 1 => HalfWord | 2 => Byte | _ => DBWord end in
+  match Int.unsigned imm with
+  | 256 => Some (LOAD_ACQUIRE size)
+  | 272 => Some (STORE_RELEASE size)
+  | op =>
+    if Z.eqb sz 0 || Z.eqb sz 3 then
+      match op with
+      | 0   => Some (AtomicADD width no_fetch)
+      | 1   => Some (AtomicADD width with_fetch)
+      | 64  => Some (AtomicOR width no_fetch)
+      | 65  => Some (AtomicOR width with_fetch)
+      | 80  => Some (AtomicAND width no_fetch)
+      | 81  => Some (AtomicAND width with_fetch)
+      | 160 => Some (AtomicXOR width no_fetch)
+      | 161 => Some (AtomicXOR width with_fetch)
+      | 225 => Some (AtomicXCHG width)
+      | 241 => Some (AtomicCMPXCHG width)
+      | _   => None
+      end
+    else None
+  end.
+
 Definition decode_insn (opcode : byte) (dst_reg src_reg : ireg) (off : Ptrofs.int) (imm : int) : option instruction :=
   let op_val := Byte.unsigned opcode in
 
@@ -163,6 +190,10 @@ Definition decode_insn (opcode : byte) (dst_reg src_reg : ireg) (off : Ptrofs.in
   else if is_ldx || is_st || is_stx then
     if Z.eqb op_val 0xc2 then 
       if check_imm_0 && check_off_0 && check_src_r0 && check_dst_r0 then Some Pno_spec else None
+    else if is_stx && Z.eqb (Z.shiftr op_val 5) 0x6 then
+      match decode_atomic (Z.land (Z.shiftr op_val 3) 0x3) imm with
+      | Some op => Some (Patomic op dst_reg (inl src_reg) off)
+      | None => None end
     else if Z.eqb (Z.shiftr op_val 5) 0x3 then (* Mode = MEM (0x60) *)
       let sz := Z.land (Z.shiftr op_val 3) 0x3 in (* Size bits 3-4 *)
       let mem_sz := match sz with
