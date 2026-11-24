@@ -190,13 +190,16 @@ Inductive call_type : Type :=
   AND       0x50   atomic and
   XOR       0xa0   atomic xor
 *)
+(** Fetch controls whether a read-modify-write returns the old memory value. *)
+Inductive fetch : Type := with_fetch | no_fetch.
+
 Inductive atomic_type : Type :=
-  | AtomicADD (is_db: bool)
-  | AtomicOR  (is_db: bool)
-  | AtomicAND (is_db: bool)
-  | AtomicXOR (is_db: bool)
-  | AtomicXCHG (is_db: bool)
-  | AtomicCMPXCHG (is_db: bool)
+  | AtomicADD (w: width) (f: fetch)
+  | AtomicOR  (w: width) (f: fetch)
+  | AtomicAND (w: width) (f: fetch)
+  | AtomicXOR (w: width) (f: fetch)
+  | AtomicXCHG (w: width)
+  | AtomicCMPXCHG (w: width)
   | LOAD_ACQUIRE (sz:sizeOp)
   | STORE_RELEASE (sz:sizeOp)
   .

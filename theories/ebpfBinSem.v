@@ -1103,39 +1103,72 @@ Definition update_core (tp: ThreadPool) (t: tid) (r: regset): ThreadPool :=
 |}.
 
 
-Definition atomic_fun (w: width) (aty: atomic_type) :=
+(** The encoded atomic width determines the memory operation. The legacy
+    width argument is retained at the relation boundary but cannot alter it. *)
+Definition atomic_width (aty : atomic_type) :=
   match aty with
-  | AtomicADD w => if w then Val.addl else Val.add
-  | AtomicOR  w => if w then Val.orl else Val.or
-  | AtomicXOR w => if w then Val.xorl else Val.xorl
-  | AtomicAND w => if w then Val.andl else Val.andl
-  | _ => Val.andl (** TODO *)
+  | AtomicADD w _ | AtomicOR w _ | AtomicAND w _ | AtomicXOR w _
+  | AtomicXCHG w | AtomicCMPXCHG w => w
+  | LOAD_ACQUIRE k | STORE_RELEASE k => sizew k
   end.
-
+Definition atomic_fun (_w: width) (aty: atomic_type) :=
+  match aty with
+  | AtomicADD w _ => match w with W32 => Val.add | W64 => Val.addl end
+  | AtomicOR w _ => match w with W32 => Val.or | W64 => Val.orl end
+  | AtomicXOR w _ => match w with W32 => Val.xor | W64 => Val.xorl end
+  | AtomicAND w _ => match w with W32 => Val.and | W64 => Val.andl end
+  | AtomicXCHG _ | AtomicCMPXCHG _ => fun _ new => new
+  | LOAD_ACQUIRE _ | STORE_RELEASE _ => fun old _ => old
+  end.
 Definition chunk_of_width (w: width) :=
-  match w with
-  | W32 => Mint32
-  | W64 => Mint64
-  end.
-
-Definition exec_atomic_store (w: width) (aty: atomic_type) (dst src: ireg) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
-  let addr := Val.offset_ptr (rs dst) o in
-  let sv := match w with W32 => Val.loword (rs src) | W64 => rs src end in
+  match w with W32 => Mint32 | W64 => Mint64 end.
+Definition atomic_result_register aty dst src : option ireg :=
+  match aty with
+  | AtomicADD _ f | AtomicOR _ f | AtomicAND _ f | AtomicXOR _ f =>
+      match f with with_fetch => Some src | no_fetch => None end
+  | AtomicXCHG _ => Some src
+  | AtomicCMPXCHG _ => Some R0
+  | LOAD_ACQUIRE _ => Some dst
+  | _ => None end.
+Definition atomic_writeback aty dst src old (rs : regset) :=
+  nextinstr (match atomic_result_register aty dst src with
+    | Some r => rs # r <- (load_value_casting old) | None => rs end).
+Definition atomic_should_store aty w m old expected : option bool :=
+  match aty with
+  | AtomicCMPXCHG _ => match w with
+      | W32 => Val.cmpu_bool (Mem.valid_pointer m) Ceq old expected
+      | W64 => Val.cmplu_bool (Mem.valid_pointer m) Ceq old expected end
+  | _ => Some true end.
+Definition exec_atomic_store (_w: width) (aty: atomic_type) (dst src: ireg) (o : off)
+    (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+  match aty with
+  | LOAD_ACQUIRE k => exec_load k dst src o rs stk code_id tail_call_cnt m []
+  | STORE_RELEASE k => exec_store k dst (inl src) o rs stk code_id tail_call_cnt m
+  | _ =>
+    let w := atomic_width aty in
+    let addr := Val.offset_ptr (rs dst) o in
+    let sv := match w with W32 => Val.loword (rs src) | W64 => rs src end in
+    let expected := match w with W32 => Val.loword (rs R0) | W64 => rs R0 end in
     match Mem.loadv (chunk_of_width w) m addr with
     | None => Stuck
-    | Some v =>
-      let res := (atomic_fun w aty v sv) in
-        match Mem.storev (chunk_of_width w) m addr res with
+    | Some old =>
+      match atomic_should_store aty w m old expected with
+      | None => Stuck
+      | Some false => Next (atomic_writeback aty dst src old rs) stk code_id tail_call_cnt m
+      | Some true =>
+        match Mem.storev (chunk_of_width w) m addr (atomic_fun w aty old sv) with
         | None => Stuck
-        | Some m' => Next (nextinstr rs) stk code_id tail_call_cnt m'
+        | Some m' => Next (atomic_writeback aty dst src old rs) stk code_id tail_call_cnt m'
         end
-    end.
-
-Definition exec_atomic (w: width) (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off) (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
+      end
+    end
+  end.
+Definition exec_atomic (w: width) (aty: atomic_type) (dst: ireg) (src: ireg+imm) (o : off)
+    (rs:regset) (stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): outcome :=
   match src with
   | inl r => exec_atomic_store w aty dst r o rs stk code_id tail_call_cnt m
   | _ => Stuck
-  end. 
+  end.
 
 Definition exec_atomic_instr_event (aty: atomic_type): etrace :=
   [eBPF_vload].
