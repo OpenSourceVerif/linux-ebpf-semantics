@@ -80,17 +80,17 @@ Definition is_final_state (ins: instruction) (stk: cstk): bool :=
   | _ => false
   end.
 (** Runtime registers are words; Vundef remains unconstrained in a trace. *)
-Definition is_abstract_value_concrete_eq (av: val) (cv: int64) (addr_map: list addr_region): bool :=
+Definition is_abstract_value_concrete_eq (av: val) (cv: int64): bool :=
   match av with
   | Vlong i => Int64.eq cv i
   | Vundef => true
   | _ => false
   end.
 
-Definition compare_final_state (rs: regset) (h: list int64) (addr_map: list addr_region): bool :=
+Definition compare_final_state (rs: regset) (h: list int64): bool :=
   match List.nth_error h 0%nat with
   | None => false
-  | Some v => is_abstract_value_concrete_eq (rs R0) v addr_map
+  | Some v => is_abstract_value_concrete_eq (rs R0) v
   end.
 
 Definition nat_of_ireg (r: ireg): nat :=
@@ -109,24 +109,24 @@ Definition nat_of_ireg (r: ireg): nat :=
   | RAX => 11
   end.
 
-Definition compare_trace_at_pc_aux (r: ireg) (rs: regset) (trace: list int64) (addr_map: list addr_region): bool :=
+Definition compare_trace_at_pc_aux (r: ireg) (rs: regset) (trace: list int64): bool :=
   match List.nth_error trace (nat_of_ireg r) with
   | None => false
-  | Some cv => is_abstract_value_concrete_eq (rs r) cv addr_map
+  | Some cv => is_abstract_value_concrete_eq (rs r) cv
   end.
 
-Definition compare_trace_at_pc (rs: regset) (trace: list int64) (addr_map: list addr_region): bool :=
-  compare_trace_at_pc_aux R0 rs trace addr_map &&
-  compare_trace_at_pc_aux R1 rs trace addr_map &&
-  compare_trace_at_pc_aux R2 rs trace addr_map &&
-  compare_trace_at_pc_aux R3 rs trace addr_map &&
-  compare_trace_at_pc_aux R4 rs trace addr_map &&
-  compare_trace_at_pc_aux R5 rs trace addr_map &&
-  compare_trace_at_pc_aux R6 rs trace addr_map &&
-  compare_trace_at_pc_aux R7 rs trace addr_map &&
-  compare_trace_at_pc_aux R8 rs trace addr_map &&
-  compare_trace_at_pc_aux R9 rs trace addr_map &&
-  compare_trace_at_pc_aux R10 rs trace addr_map.
+Definition compare_trace_at_pc (rs: regset) (trace: list int64): bool :=
+  compare_trace_at_pc_aux R0 rs trace &&
+  compare_trace_at_pc_aux R1 rs trace &&
+  compare_trace_at_pc_aux R2 rs trace &&
+  compare_trace_at_pc_aux R3 rs trace &&
+  compare_trace_at_pc_aux R4 rs trace &&
+  compare_trace_at_pc_aux R5 rs trace &&
+  compare_trace_at_pc_aux R6 rs trace &&
+  compare_trace_at_pc_aux R7 rs trace &&
+  compare_trace_at_pc_aux R8 rs trace &&
+  compare_trace_at_pc_aux R9 rs trace &&
+  compare_trace_at_pc_aux R10 rs trace.
 
 Fixpoint bpf_interpreter_trace_check
   (check_helper: option nat -> Z -> list (list int64) -> bool)
@@ -172,7 +172,7 @@ Fixpoint bpf_interpreter_trace_check
               if is_final_state ins stk then
                 match trace with
                 | [] => true
-                 (*| [h] => if compare_final_state rs h addr_map then true
+                 (*| [h] => if compare_final_state rs h then true
                          else debug_fail_exec 2 (Ptrofs.of_int64 ofs) ins rs (Pregmap.init (Vlong Int64.zero)) h addr_map *)
                 | _ => debug_fail_common "Program finished before trace ended"
                 end
@@ -188,7 +188,7 @@ Fixpoint bpf_interpreter_trace_check
                     match trace with
                     | [] => debug_fail_common "Trace ended before program finished" (* (* The next instruction should be BPF_exit *) bpf_interpreter_trace_check k addr_map init_sp bpf_prog [] next_st *)
                     | h :: t => 
-                      if compare_trace_at_pc rs_after h addr_map then
+                      if compare_trace_at_pc rs_after h then
                         bpf_interpreter_trace_check check_helper k addr_map init_sp bpf_prog t next_st
                       else
                         debug_fail_exec 0 (Ptrofs.of_int64 ofs) ins rs rs_after h addr_map

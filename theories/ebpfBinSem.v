@@ -41,7 +41,7 @@ Definition cast_address_abs_to_concrete (ptr: val) (regions: list addr_region): 
       | None => None
       | Some r =>
           let offset := Ptrofs.unsigned ofs in
-          if address_region_valid r && (0 <=? offset) && (offset <? size_blk r)
+          if address_region_valid r && (offset <? size_blk r)
           then Some (Int64.repr (Int64.unsigned (base_addr r) + offset))
           else None
       end
@@ -656,11 +656,16 @@ Definition load_value_casting (v: val): val :=
   | _ => v
   end.
 
-Definition load_result (signed: bool) (v: val) (addr_map: list addr_region): option val :=
+Definition load_value_sx_casting (v: val): val :=
   match v with
-  | Vint i => Some (Vlong (Int64.repr (if signed then Int.signed i else Int.unsigned i)))
-  | _ => register_word v addr_map
+  | Vint i => Vlong (Int64.repr (Int.signed i))
+  | _ => v
   end.
+
+Definition load_result (signed: bool) (v: val) (addr_map: list addr_region): option val :=
+  register_word
+    (if signed then load_value_sx_casting v else load_value_casting v)
+    addr_map.
 
 Definition exec_memory_load (read: sizeOp -> val -> mem -> option val)
     (signed probe: bool) (k: sizeOp) (r r': ireg) (o: off)
@@ -689,12 +694,6 @@ Definition loadsx (k: sizeOp) (addr:val) (m: mem) :=
   | Word      => loadv_unaligned Mint32 m addr
   | DBWord    => None
   (* if Archi.ptr64 then Mem.loadv Mint64 m addr else None *)
-  end.
-
-Definition load_value_sx_casting (v: val): val :=
-  match v with
-  | Vint i => Vlong (Int64.repr (Int.signed i))
-  | _ => v
   end.
 
 Definition exec_loadsx := exec_memory_load loadsx true false.
@@ -943,15 +942,12 @@ Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat)
 
 Definition MAX_TAIL_CALL_CNT: nat := 33.
 
-Definition exec_tail_call_addr (m: mem) (r2: val) (addr_map: list addr_region): option val :=
-  resolve_address m r2 Ptrofs.zero addr_map.
-
 Definition exec_tail_call (p: ebpf_prog) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) :=
   match rs R3 with
   | Vlong i =>
     (* The Linux interpreter converts R3 to u32 before the bounds check and lookup. *)
     let index := Int64.zero_ext 32 i in
-    match exec_tail_call_addr m (rs R2) addr_map with
+    match resolve_address m (rs R2) Ptrofs.zero addr_map with
     | None => Stuck
     | Some r2_ptr =>
       match r2_ptr with
