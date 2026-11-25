@@ -20,11 +20,9 @@ Definition dummy_function := mkfunction signature_main 0 nil. *)
 
 (** * Operational semantics *)
 
-(** The semantics operates over a single mapping from registers
-  (type [preg]) to values.  We maintain (but do not enforce)
-  the convention that integer registers are mapped to values of
-  type [Tint], float registers to values of type [Tfloat],
-  and condition bits to either [Vzero] or [Vone]. *)
+(** Registers contain 64-bit words or Vundef. PC is a slot index;
+    program identity is carried separately by code_id. Vptr is internal to
+    CompCert memory operations and address conversion. *)
 
 Definition regset := Pregmap.t val. (*
 Definition genv := Genv.t fundef unit. *)
