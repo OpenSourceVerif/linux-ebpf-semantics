@@ -155,22 +155,11 @@ Variable ebpf_call_function:
 Variable helper_id_at: ebpf_prog -> option nat -> Z -> option Z.
 
 
-(** Manipulations over the [PC] register: continuing with the next
-  instruction ([nextinstr]) or branching to a label ([goto_label]). *)
+(** Advance the numeric slot PC by one. *)
 Definition nextinstr (rs: regset) :=
   rs#PC <- (Val.addl rs#PC (Vlong Int64.one)).
 
-(*
-Definition goto_label (f: function) (lbl: label) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  match label_pos lbl 0 (fn_code f) with
-  | None => Stuck
-  | Some pos =>
-      match rs#PC with
-      | Vptr b ofs => Next (rs#PC <- (Vptr b (Ptrofs.repr pos))) m
-      | _          => Stuck
-      end
-  end.
-*)
+
 
 Definition int64_of_int (i:int) := Int64.repr (Int.signed i).
 Definition int_of_int64 (i:int64) := Int.repr (Int64.signed i).
@@ -603,28 +592,6 @@ Definition exec_jmpcmp (op: cmpOp) (w: width) (r: ireg) (ri: ireg+imm) (o: off) 
  *)
 
  
-
-
-  (*
-(** TODO: pseudo_ptr_ty should be used following the implementation of resolve_pseudo_ldimm64 in verifier.c  *)
-Fixpoint cast_i2p_aux (ty: pseudo_ptr_ty) (v: int64) (b: block) (ofs: ptrofs) (l_ptr: list int64) (addr_map: list addr_region) : option val :=
-  match l_ptr with
-  | [] => Some (Vlong v)
-  | h :: tl =>
-    if Int64.eq h (Ptrofs.to_int64 ofs) then
-      (** for eBPF program, instruction [i.e. LDDW (+ external call for the validation purpose)] at pc: the result should be computed as a pointer *)
-      find_abstract_address v addr_map
-    else
-      cast_i2p_aux ty v b ofs tl addr_map
-  end.
-
-Definition cast_i2p (ty: pseudo_ptr_ty) (v: int64) (pc: val) (l_ptr: list int64) (addr_map: list addr_region): option val :=
-  match pc with
-  | Vptr b ofs => cast_i2p_aux ty v b ofs l_ptr addr_map
-  | _ => None
-  end. *)
-
-
 Definition loadv_unaligned (chunk: memory_chunk) (m: mem) (addr: val) : option val :=
   match addr with
   | Vptr b ofs =>
@@ -684,7 +651,6 @@ Definition exec_memory_load (read: sizeOp -> val -> mem -> option val)
   end.
 
 Definition exec_load := exec_memory_load load false false.
-
 Definition exec_load_probe := exec_memory_load load false true.
 
 Definition loadsx (k: sizeOp) (addr:val) (m: mem) :=
@@ -697,16 +663,6 @@ Definition loadsx (k: sizeOp) (addr:val) (m: mem) :=
   end.
 
 Definition exec_loadsx := exec_memory_load loadsx true false.
-
-Definition loadsx_probe (k: sizeOp) (addr:val) (m: mem) :=
-  match k with
-  | Byte      => match loadv_unaligned Mint8signed m addr with | None => Some Vzero | Some v => Some v end
-  | HalfWord  => match loadv_unaligned Mint16signed m addr with | None => Some Vzero | Some v => Some v end
-  | Word      => match loadv_unaligned Mint32 m addr with | None => Some Vzero | Some v => Some v end
-  | DBWord    => None
-  (* if Archi.ptr64 then Mem.loadv Mint64 m addr else None *)
-  end.
-
 Definition exec_loadsx_probe (k: sizeOp) :=
   match k with
   | DBWord => exec_memory_load loadsx true false k
@@ -734,9 +690,10 @@ Definition exec_store (k: sizeOp) (r:ireg) (ri:ireg+int) (o:off)
       end
   end.
 
-Definition exec_lddw (ty: pseudo_ptr_ty) (r:ireg) (lo hi: imm)
-    (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat)
-    (m: mem) (addr_map: list addr_region): outcome :=
+(** Immediates, including already resolved pseudo addresses, remain words.
+    Resolving a map FD or index is a separate loader/environment obligation. *)
+Definition exec_lddw (r:ireg) (lo hi: imm) (rs: regset) (c_stk: cstk)
+    (code_id: option nat) (tail_call_cnt: nat) (m: mem) : outcome :=
   Next (nextinstr (nextinstr (rs#r <- (Vlong (Int64.ofwords hi lo)))))
     c_stk code_id tail_call_cnt m.
 
@@ -770,80 +727,14 @@ Definition def_caller_save_regs (rs: regset) : regset :=
     | _ => Vundef
     end.
 
-(*
-Definition spilling_callee_save_registers (ofs_r6 ofs_r7 ofs_r8 ofs_r9: ptrofs)
-  (bp: val) (rs: regset) (m1: mem): option mem := 
-  match Mem.storev Mptr m1 (Val.offset_ptr bp ofs_r6) rs#R6 with
-  | None => None
-  | Some m2 =>
-    match Mem.storev Mptr m2 (Val.offset_ptr bp ofs_r7) rs#R7 with
-    | None => None
-    | Some m3 =>
-      match Mem.storev Mptr m3 (Val.offset_ptr bp ofs_r8) rs#R8 with
-      | None => None
-      | Some m4 => Mem.storev Mptr m4 (Val.offset_ptr bp ofs_r9) rs#R9
-      end
-    end
-  end. *)
-
-Definition stack_offset (z:Z) :=
-  Ptrofs.repr (z - 6*8). (**r RA + SP + R6 + R7 + R8 + R9 *)
-
-(**r The thread-local eBPF memory layout is:
-
-| ....     |
------------- <-- New BP when internal call occurs
-|  old_r9  |
------------- <-- R10 + 5*8
-|  old_r8  |
------------- <-- R10 + 4*8
-|  old_r7  |
------------- <-- R10 + 3*8
-|  old_r6  |
------------- <-- R10 + 2*8
-|  old_sp  |
------------- <-- R10 + 1*8
-|  old_ra  |
------------- <-- R10 or SP
-|          |
-| 512Byte  |
-|          |
------------- <-- BP
-
-
-**)
-
+(** Each frame has 512 bytes of data. Return PC and saved register words
+    live in cstk, not in the program-visible memory. *)
 Definition bpf_stack_size: Z := 512%Z.
 
-(*
-Definition alloc_frame (sz: Z) (ofs_link ofs_ra ofs_r6 ofs_r7 ofs_r8 ofs_r9: ptrofs)
-  (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): option (regset * mem) := 
-  let (m1, stk) := Mem.alloc m 0 sz in
-  let bp := (Vptr stk Ptrofs.zero) in
-  let sp := Val.offset_ptr bp (stack_offset sz) in
-  let ra := Val.offset_ptr rs#PC Ptrofs.one in
-    match Mem.storev Mptr m1 (Val.offset_ptr bp ofs_link) rs#BP with
-    | None => None
-    | Some m2 =>
-      match Mem.storev Mptr m2 (Val.offset_ptr bp ofs_ra) ra with
-      | None => None
-      | Some m3 =>
-        match spilling_callee_save_registers ofs_r6 ofs_r7 ofs_r8 ofs_r9 bp rs m3 with
-        | None => None
-        | Some m4 => Some (nextinstr (rs #R10 <- sp #BP <- bp), m4)
-        end
-      end
-    end.
 
-Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  let target_pc := Val.offset_ptr (Val.offset_ptr (rs PC) (Ptrofs.of_int i)) Ptrofs.one in
-    match alloc_frame (bpf_stack_size+6*8) (Ptrofs.repr (bpf_stack_size+0*8)) (Ptrofs.repr (bpf_stack_size+1*8))
-      (Ptrofs.repr (bpf_stack_size+2*8)) (Ptrofs.repr (bpf_stack_size+3*8)) (Ptrofs.repr (bpf_stack_size+4*8)) (Ptrofs.repr (bpf_stack_size+5*8)) rs m with
-    | None => Stuck
-    | Some (rs', m') => Next (def_caller_save_regs rs')#PC <- target_pc m'
-    end.
-*)
 
+(** The address environment reserves a region for each allocated frame.
+    Missing layout information causes Stuck rather than inventing an address. *)
 Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk)
     (code_id: option nat) (tail_call_cnt: nat) (m: mem)
     (addr_map: list addr_region): outcome :=
@@ -859,65 +750,12 @@ Definition exec_call_internal (i: imm) (rs: regset) (c_stk: cstk)
         #R10 <- (Vlong top)) (saved :: c_stk) code_id tail_call_cnt m'
   end.
 
-(*
-Definition reload_callee_save_registers (ofs_r6 ofs_r7 ofs_r8 ofs_r9: ptrofs)
-  (bp: val) (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): option regset := 
-  match Mem.loadv Mptr m (Val.offset_ptr bp ofs_r6) with
-  | None => None
-  | Some v6 =>
-    match Mem.loadv Mptr m (Val.offset_ptr bp ofs_r7) with
-    | None => None
-    | Some v7 =>
-      match Mem.loadv Mptr m (Val.offset_ptr bp ofs_r8) with
-      | None => None
-      | Some v8 => 
-        match Mem.loadv Mptr m (Val.offset_ptr bp ofs_r9) with
-        | None => None
-        | Some v9 => Some (rs#R6 <- v6 #R7 <- v7 #R8 <- v8 #R9 <- v9)
-        end
-      end
-    end
-  end.
-
-Definition free_frame (sz: Z) (ofs_link ofs_ra ofs_r6 ofs_r7 ofs_r8 ofs_r9: ptrofs)
-  (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem): option (regset * mem) :=
-  match Mem.loadv Mptr m (Val.offset_ptr rs#BP ofs_ra) with
-  | None => None
-  | Some ra =>
-    match Mem.loadv Mptr m (Val.offset_ptr rs#BP ofs_link) with
-    | None => None
-    | Some bp =>
-      match reload_callee_save_registers ofs_r6 ofs_r7 ofs_r8 ofs_r9 rs#BP rs m with
-      | None => None
-      | Some rs' =>
-        match rs'#BP with
-        | Vptr stk ofs =>
-          match Mem.free m stk 0 sz with
-          | None => None
-          | Some m' =>
-            let sp := Val.offset_ptr bp (stack_offset sz) in
-              Some (nextinstr (rs'#R10 <- sp #BP <- bp #PC <- ra), m')
-          end
-        |  _   => None
-        end
-      end
-    end
-  end.
-
-Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) :=
-  match free_frame (bpf_stack_size+6*8) (Ptrofs.repr (bpf_stack_size+0*8)) (Ptrofs.repr (bpf_stack_size+1*8))
-      (Ptrofs.repr (bpf_stack_size+2*8)) (Ptrofs.repr (bpf_stack_size+3*8)) (Ptrofs.repr (bpf_stack_size+4*8)) (Ptrofs.repr (bpf_stack_size+5*8)) rs m with
-  | None => Stuck
-  | Some (rs', m') => Next (undef_caller_save_regs rs') m'
-  end.
-*)
-
-Definition exit_pc := Vundef.
-
+(** A halted PC is distinct from every numeric slot, including wrapped jumps.
+    From a numeric PC, arithmetic cannot manufacture this terminal marker. *)
 Definition exec_ret (rs: regset) (c_stk: cstk) (code_id: option nat)
     (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region): outcome :=
   match c_stk with
-  | [] => Next (rs#PC <- exit_pc) [] code_id tail_call_cnt m
+  | [] => Next (rs#PC <- Vundef) [] code_id tail_call_cnt m
   | saved :: rest =>
       (* R10 is one-past the current frame; resolve its base instead. *)
       let freed :=
@@ -988,7 +826,7 @@ Definition exec_tail_call (p: ebpf_prog) (rs: regset) (c_stk: cstk) (code_id: op
 
 Definition exec_instr (p: ebpf_prog) (i: instruction) (rs:regset) (c_stk: cstk) (code_id: option nat) (tail_call_cnt: nat) (m: mem) (addr_map: list addr_region) : outcome :=
   match i with
-  | Plddw ty r lo hi         => exec_lddw ty r lo hi rs c_stk code_id tail_call_cnt m addr_map
+  | Plddw ty r lo hi         => exec_lddw r lo hi rs c_stk code_id tail_call_cnt m
   | Ploadsx k r r' o         => exec_loadsx k r r' o rs c_stk code_id tail_call_cnt m addr_map
   | Pload_probe k r r' o     => exec_load_probe k r r' o rs c_stk code_id tail_call_cnt m addr_map
   | Ploadsx_probe k r r' o   => exec_loadsx_probe k r r' o rs c_stk code_id tail_call_cnt m addr_map
@@ -1067,6 +905,8 @@ Definition exec_instr_event (i: instruction) : etrace :=
   | _                     => eE0
   end.
 
+(** Quantify the selected index universally: choosing an unrelated index in a
+    rule constructor would leave the active program's code unconstrained. *)
 Inductive step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> etrace -> tls_state -> Prop :=
   | exec_step_internal:
       forall c ofs i rs stk code_id tail_call_cnt m rs' stk' code_id' tail_call_cnt' m' et,
@@ -1112,10 +952,9 @@ Inductive initial_lst_state (addr_map: list addr_region) (ctx stk: block): tls_s
       (forall i, 0 <= i -> i < bpf_stack_size -> Mem.valid_access m Mint8unsigned stk i Freeable) ->
       initial_lst_state addr_map ctx stk (TLS_State rs [] None 0 m).
 
-(* TODO: not sure here: the return value R0 could be a pointer (Vptr b ofs) or (Vlong int64) *)
 Inductive final_lst_state (addr_map: list addr_region) (stk: block): tls_state -> val -> Prop :=
   | final_lst_state_intro: forall rs m t k word top,
-      rs PC = exit_pc ->
+      rs PC = Vundef ->
       rs R0 = Vlong word ->
       stack_top_word stk bpf_stack_size addr_map = Some top ->
       rs R10 = Vlong top ->
@@ -1260,6 +1099,7 @@ Inductive atomic_step (addr_map: list addr_region) (p: ebpf_prog): tls_state -> 
 
 Section eBPF_GlobalSem.
 
+(** One address environment is shared by every step in an execution. *)
 Variable global_addr_map: list addr_region.
 
 Inductive nstep: tid -> state -> etrace -> state -> Prop :=

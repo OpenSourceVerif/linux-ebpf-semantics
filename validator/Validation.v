@@ -164,7 +164,7 @@ Fixpoint bpf_interpreter_trace_check
                 | Some r0 =>
                   if check_helper code_id (Int64.unsigned ofs) trace then
                   bpf_interpreter_trace_check check_helper k addr_map init_sp bpf_prog t
-                    (Next (nextinstr (rs#R0 <- (Vlong r0))) stk code_id tail_call_cnt m)
+                    (Next (nextinstr ((undef_caller_save_regs rs)#R0 <- (Vlong r0))) stk code_id tail_call_cnt m)
                   else debug_fail_common "Helper event does not match the executed call"
                 end
               end
